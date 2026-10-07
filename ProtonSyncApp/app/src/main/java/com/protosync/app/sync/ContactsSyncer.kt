@@ -2,7 +2,6 @@ package com.protosync.app.sync
 
 import android.content.ContentProviderOperation
 import android.content.ContentResolver
-import android.content.ContentUris
 import android.content.Context
 import android.provider.ContactsContract
 import com.protosync.app.util.SyncLog as Log
@@ -12,6 +11,12 @@ import com.protosync.app.util.SyncAccount
 import javax.inject.Inject
 import javax.inject.Singleton
 
+data class ContactSyncItem(
+    val protonId: String,
+    val vCard: VCard,
+    val hash: String
+)
+
 @Singleton
 class ContactsSyncer @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -20,24 +25,47 @@ class ContactsSyncer @Inject constructor(
 
     private val TAG = "ContactsSyncer"
 
+    fun getExistingContactHashes(): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        val projection = arrayOf(
+            ContactsContract.RawContacts.SOURCE_ID,
+            ContactsContract.RawContacts.SYNC1
+        )
+        val selection = "${ContactsContract.RawContacts.ACCOUNT_TYPE} = ? AND ${ContactsContract.RawContacts.ACCOUNT_NAME} = ? AND ${ContactsContract.RawContacts.SOURCE_ID} IS NOT NULL"
+        context.contentResolver.query(
+            rawContactsUri(), projection, selection, arrayOf(ACCOUNT_TYPE, ACCOUNT_NAME), null
+        )?.use { cursor ->
+            val sourceIdIndex = cursor.getColumnIndexOrThrow(ContactsContract.RawContacts.SOURCE_ID)
+            val sync1Index = cursor.getColumnIndexOrThrow(ContactsContract.RawContacts.SYNC1)
+            while (cursor.moveToNext()) {
+                val sourceId = cursor.getString(sourceIdIndex)
+                val hash = cursor.getString(sync1Index)
+                if (sourceId != null && hash != null) {
+                    map[sourceId] = hash
+                }
+            }
+        }
+        return map
+    }
+
     /**
-     * Writes decrypted [contacts] into the Android contacts provider under the ProtonSync account.
+     * Writes decrypted contacts into the Android contacts provider under the ProtonSync account.
      * Uses the Proton contact ID as SOURCE_ID to perform idempotent updates/inserts.
      * Existing contacts not present in the Proton list are deleted.
      */
-    fun sync(contacts: List<Pair<String, VCard>>): Int {
+    fun sync(contactsToSync: List<ContactSyncItem>, allProtonIds: Set<String>): Int {
         syncAccount.ensureExists(ACCOUNT_TYPE, ACCOUNT_NAME)
         val resolver = context.contentResolver
         
         val existingContacts = getExistingRawContacts(resolver)
-        val processedProtonIds = mutableSetOf<String>()
         
         var written = 0
         val batch = ArrayList<ContentProviderOperation>()
 
-        for ((protonId, vCard) in contacts) {
-            processedProtonIds.add(protonId)
+        for (item in contactsToSync) {
+            val protonId = item.protonId
             val existingRawContactId = existingContacts[protonId]
+            val vCard = item.vCard
             
             val rawContactOpIndex = batch.size
 
@@ -48,12 +76,24 @@ class ContactsSyncer @Inject constructor(
                         .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, ACCOUNT_TYPE)
                         .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, ACCOUNT_NAME)
                         .withValue(ContactsContract.RawContacts.SOURCE_ID, protonId)
+                        .withValue(ContactsContract.RawContacts.SYNC1, item.hash)
                         .build()
                 )
             } else {
+                // UPDATE: Update hash on RawContact
+                batch.add(
+                    ContentProviderOperation.newUpdate(rawContactsUri())
+                        .withSelection(
+                            "${ContactsContract.RawContacts._ID} = ?", 
+                            arrayOf(existingRawContactId.toString())
+                        )
+                        .withValue(ContactsContract.RawContacts.SYNC1, item.hash)
+                        .build()
+                )
+                
                 // UPDATE: Delete existing data rows for this RawContact
                 batch.add(
-                    ContentProviderOperation.newDelete(ContactsContract.Data.CONTENT_URI)
+                    ContentProviderOperation.newDelete(dataUri())
                         .withSelection(
                             "${ContactsContract.Data.RAW_CONTACT_ID} = ?", 
                             arrayOf(existingRawContactId.toString())
@@ -70,7 +110,7 @@ class ContactsSyncer @Inject constructor(
                 ?: "Unknown"
 
             fun addDataInsert(mimeType: String, config: ContentProviderOperation.Builder.() -> Unit) {
-                val builder = ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                val builder = ContentProviderOperation.newInsert(dataUri())
                 if (existingRawContactId == null) {
                     builder.withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactOpIndex)
                 } else {
@@ -119,7 +159,7 @@ class ContactsSyncer @Inject constructor(
         }
 
         // Handle deletions
-        val idsToDelete = existingContacts.keys - processedProtonIds
+        val idsToDelete = existingContacts.keys - allProtonIds
         for (protonId in idsToDelete) {
             batch.add(
                 ContentProviderOperation.newDelete(rawContactsUri())
@@ -129,6 +169,16 @@ class ContactsSyncer @Inject constructor(
                     )
                     .build()
             )
+            
+            // Chunk deletions to prevent TransactionTooLargeException
+            if (batch.size > 250) {
+                try {
+                    resolver.applyBatch(ContactsContract.AUTHORITY, batch)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Delete batch failed", e)
+                }
+                batch.clear()
+            }
         }
 
         if (batch.isNotEmpty()) {
@@ -139,7 +189,7 @@ class ContactsSyncer @Inject constructor(
             }
         }
         
-        Log.i(TAG, "Contacts sync wrote $written/${contacts.size} contacts, deleted ${idsToDelete.size}")
+        Log.i(TAG, "Contacts sync wrote $written contacts, deleted ${idsToDelete.size}")
         return written
     }
 
@@ -177,6 +227,11 @@ class ContactsSyncer @Inject constructor(
     private fun rawContactsUri() = ContactsContract.RawContacts.CONTENT_URI.buildUpon()
         .appendQueryParameter(ContactsContract.RawContacts.ACCOUNT_TYPE, ACCOUNT_TYPE)
         .appendQueryParameter(ContactsContract.RawContacts.ACCOUNT_NAME, ACCOUNT_NAME)
+        .appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true")
+        .build()
+        
+    private fun dataUri() = ContactsContract.Data.CONTENT_URI.buildUpon()
+        .appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true")
         .build()
 
     companion object {

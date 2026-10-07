@@ -10,7 +10,6 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
-import ezvcard.VCard
 import me.proton.core.accountmanager.domain.AccountManager
 import me.proton.core.accountmanager.domain.getPrimaryAccount
 import me.proton.core.contact.domain.decryptContactCard
@@ -20,6 +19,7 @@ import me.proton.core.crypto.common.context.CryptoContext
 import me.proton.core.user.domain.UserManager
 import kotlinx.coroutines.flow.first
 import com.protosync.app.sync.ContactsSyncer
+import com.protosync.app.sync.ContactSyncItem
 import com.protosync.app.util.SyncSettings
 
 @HiltWorker
@@ -52,11 +52,22 @@ class ContactsSyncWorker @AssistedInject constructor(
         return try {
             val user = userManager.getUser(account.userId)
             val contacts = contactRepository.getAllContacts(account.userId)
-            val decryptedVCards = mutableListOf<Pair<String, VCard>>()
+            val existingHashes = contactsSyncer.getExistingContactHashes()
+            val contactsToSync = mutableListOf<ContactSyncItem>()
+            val allProtonIds = mutableSetOf<String>()
 
             for (contact in contacts) {
                 try {
+                    val protonId = contact.id.toString()
+                    allProtonIds.add(protonId)
+
                     val withCards = contactRepository.getContactWithCards(account.userId, contact.id)
+                    val currentHash = withCards.hashCode().toString()
+
+                    if (existingHashes[protonId] == currentHash) {
+                        continue
+                    }
+
                     val card = user.useKeys(cryptoContext) {
                         withCards.contactCards.firstNotNullOfOrNull { c ->
                             try {
@@ -67,19 +78,19 @@ class ContactsSyncWorker @AssistedInject constructor(
                             }
                         }
                     }
-                    if (card != null) decryptedVCards.add(contact.id.toString() to card)
+                    if (card != null) contactsToSync.add(ContactSyncItem(protonId, card, currentHash))
                 } catch (e: Exception) {
                     Log.w(TAG, "Decrypt failed for contact ${contact.id}: ${e.message}")
                 }
             }
 
-            contactsSyncer.sync(decryptedVCards)
+            contactsSyncer.sync(contactsToSync, allProtonIds)
             syncSettings.lastContactSyncTime = System.currentTimeMillis()
-            Log.i(TAG, "Contact sync completed: ${decryptedVCards.size}/${contacts.size} decrypted")
+            Log.i(TAG, "Contact sync completed: ${contactsToSync.size}/${contacts.size} updated")
             Result.success(
                 workDataOf(
                     "contacts_total" to contacts.size.toLong(),
-                    "contacts_written" to decryptedVCards.size.toLong(),
+                    "contacts_written" to contactsToSync.size.toLong(),
                 )
             )
         } catch (e: Exception) {
