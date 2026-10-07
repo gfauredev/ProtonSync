@@ -52,7 +52,7 @@ class ContactsSyncWorker @AssistedInject constructor(
         return try {
             val user = userManager.getUser(account.userId)
             val contacts = contactRepository.getAllContacts(account.userId)
-            val decryptedVCards = mutableListOf<VCard>()
+            val decryptedVCards = mutableListOf<Pair<String, VCard>>()
 
             for (contact in contacts) {
                 try {
@@ -67,7 +67,7 @@ class ContactsSyncWorker @AssistedInject constructor(
                             }
                         }
                     }
-                    if (card != null) decryptedVCards += card
+                    if (card != null) decryptedVCards.add(contact.id.toString() to card)
                 } catch (e: Exception) {
                     Log.w(TAG, "Decrypt failed for contact ${contact.id}: ${e.message}")
                 }

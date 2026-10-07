@@ -21,22 +21,46 @@ class ContactsSyncer @Inject constructor(
     private val TAG = "ContactsSyncer"
 
     /**
-     * Writes decrypted [vCards] into the Android contacts provider under the ProtonSync account.
-     * A fresh raw contact is created for each vCard. Mapping between Proton contact IDs and
-     * Android raw contact IDs is intentionally left to a future phase (idempotent update/delete).
+     * Writes decrypted [contacts] into the Android contacts provider under the ProtonSync account.
+     * Uses the Proton contact ID as SOURCE_ID to perform idempotent updates/inserts.
+     * Existing contacts not present in the Proton list are deleted.
      */
-    fun sync(vCards: List<VCard>): Int {
+    fun sync(contacts: List<Pair<String, VCard>>): Int {
         syncAccount.ensureExists(ACCOUNT_TYPE, ACCOUNT_NAME)
         val resolver = context.contentResolver
+        
+        val existingContacts = getExistingRawContacts(resolver)
+        val processedProtonIds = mutableSetOf<String>()
+        
         var written = 0
+        val batch = ArrayList<ContentProviderOperation>()
 
-        for (vCard in vCards) {
-            val insert = ArrayList<ContentProviderOperation>()
+        for ((protonId, vCard) in contacts) {
+            processedProtonIds.add(protonId)
+            val existingRawContactId = existingContacts[protonId]
+            
+            val rawContactOpIndex = batch.size
 
-            insert += ContentProviderOperation.newInsert(rawContactsUri())
-                .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, ACCOUNT_TYPE)
-                .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, ACCOUNT_NAME)
-                .build()
+            if (existingRawContactId == null) {
+                // INSERT: Create new RawContact
+                batch.add(
+                    ContentProviderOperation.newInsert(rawContactsUri())
+                        .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, ACCOUNT_TYPE)
+                        .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, ACCOUNT_NAME)
+                        .withValue(ContactsContract.RawContacts.SOURCE_ID, protonId)
+                        .build()
+                )
+            } else {
+                // UPDATE: Delete existing data rows for this RawContact
+                batch.add(
+                    ContentProviderOperation.newDelete(ContactsContract.Data.CONTENT_URI)
+                        .withSelection(
+                            "${ContactsContract.Data.RAW_CONTACT_ID} = ?", 
+                            arrayOf(existingRawContactId.toString())
+                        )
+                        .build()
+                )
+            }
 
             val displayName = vCard.formattedName?.value
                 ?: fullNameFromStructuredName(vCard)
@@ -45,49 +69,97 @@ class ContactsSyncer @Inject constructor(
                 ?: vCard.telephoneNumbers.firstOrNull()?.text
                 ?: "Unknown"
 
-            insert += ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
-                .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE)
-                .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, displayName)
-                .build()
+            fun addDataInsert(mimeType: String, config: ContentProviderOperation.Builder.() -> Unit) {
+                val builder = ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                if (existingRawContactId == null) {
+                    builder.withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactOpIndex)
+                } else {
+                    builder.withValue(ContactsContract.Data.RAW_CONTACT_ID, existingRawContactId)
+                }
+                builder.withValue(ContactsContract.Data.MIMETYPE, mimeType)
+                builder.config()
+                batch.add(builder.build())
+            }
+
+            addDataInsert(ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE) {
+                withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, displayName)
+            }
 
             for (email in vCard.emails) {
-                insert += ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
-                    .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                    .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Email.CONTENT_ITEM_TYPE)
-                    .withValue(ContactsContract.CommonDataKinds.Email.ADDRESS, email.value)
-                    .withValue(ContactsContract.CommonDataKinds.Email.TYPE, ContactsContract.CommonDataKinds.Email.TYPE_HOME)
-                    .build()
+                addDataInsert(ContactsContract.CommonDataKinds.Email.CONTENT_ITEM_TYPE) {
+                    withValue(ContactsContract.CommonDataKinds.Email.ADDRESS, email.value)
+                    withValue(ContactsContract.CommonDataKinds.Email.TYPE, ContactsContract.CommonDataKinds.Email.TYPE_HOME)
+                }
             }
 
             for (phone in vCard.telephoneNumbers) {
-                insert += ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
-                    .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                    .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
-                    .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, phone.text)
-                    .withValue(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
-                    .build()
+                addDataInsert(ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE) {
+                    withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, phone.text)
+                    withValue(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
+                }
             }
 
             for (org in vCard.organizations) {
                 org.values.firstOrNull()?.let { company ->
-                    insert += ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
-                        .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                        .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Organization.CONTENT_ITEM_TYPE)
-                        .withValue(ContactsContract.CommonDataKinds.Organization.COMPANY, company)
-                        .build()
+                    addDataInsert(ContactsContract.CommonDataKinds.Organization.CONTENT_ITEM_TYPE) {
+                        withValue(ContactsContract.CommonDataKinds.Organization.COMPANY, company)
+                    }
                 }
             }
 
+            if (batch.size > 250) {
+                try {
+                    resolver.applyBatch(ContactsContract.AUTHORITY, batch)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Batch failed", e)
+                }
+                batch.clear()
+            }
+            written++
+        }
+
+        // Handle deletions
+        val idsToDelete = existingContacts.keys - processedProtonIds
+        for (protonId in idsToDelete) {
+            batch.add(
+                ContentProviderOperation.newDelete(rawContactsUri())
+                    .withSelection(
+                        "${ContactsContract.RawContacts.SOURCE_ID} = ? AND ${ContactsContract.RawContacts.ACCOUNT_TYPE} = ?",
+                        arrayOf(protonId, ACCOUNT_TYPE)
+                    )
+                    .build()
+            )
+        }
+
+        if (batch.isNotEmpty()) {
             try {
-                resolver.applyBatch("com.android.contacts", insert)
-                written++
+                resolver.applyBatch(ContactsContract.AUTHORITY, batch)
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to insert contact $displayName: ${e.message}")
+                Log.e(TAG, "Final batch failed", e)
             }
         }
-        Log.i(TAG, "Contacts sync wrote $written/${vCards.size} contacts")
+        
+        Log.i(TAG, "Contacts sync wrote $written/${contacts.size} contacts, deleted ${idsToDelete.size}")
         return written
+    }
+
+    private fun getExistingRawContacts(resolver: ContentResolver): Map<String, Long> {
+        val map = mutableMapOf<String, Long>()
+        val projection = arrayOf(
+            ContactsContract.RawContacts._ID, 
+            ContactsContract.RawContacts.SOURCE_ID
+        )
+        val selection = "${ContactsContract.RawContacts.ACCOUNT_TYPE} = ? AND ${ContactsContract.RawContacts.ACCOUNT_NAME} = ? AND ${ContactsContract.RawContacts.SOURCE_ID} IS NOT NULL"
+        resolver.query(
+            rawContactsUri(), projection, selection, arrayOf(ACCOUNT_TYPE, ACCOUNT_NAME), null
+        )?.use { cursor ->
+            val idIndex = cursor.getColumnIndexOrThrow(ContactsContract.RawContacts._ID)
+            val sourceIdIndex = cursor.getColumnIndexOrThrow(ContactsContract.RawContacts.SOURCE_ID)
+            while (cursor.moveToNext()) {
+                map[cursor.getString(sourceIdIndex)] = cursor.getLong(idIndex)
+            }
+        }
+        return map
     }
 
     private fun fullNameFromStructuredName(vCard: VCard): String? {
