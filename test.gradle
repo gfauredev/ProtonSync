@@ -1,0 +1,5 @@
+task printProp {
+    doLast {
+        println "Property: " + project.findProperty("android.aapt2FromMavenOverride")
+    }
+}
