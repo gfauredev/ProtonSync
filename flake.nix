@@ -39,6 +39,10 @@
           commonNativeBuildInputs = with pkgs; [
             binaryen
             clang
+            detekt # Kotlin static analysis
+            kotlin
+            ktfmt # Kotlin formatter
+            ktlint # Kotlin linter
             patchelf
             pkg-config
             unzip
