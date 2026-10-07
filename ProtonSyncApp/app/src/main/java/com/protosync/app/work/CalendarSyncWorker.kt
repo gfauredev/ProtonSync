@@ -70,7 +70,8 @@ class CalendarSyncWorker @AssistedInject constructor(
             )
 
             Log.i(TAG, "Starting calendar sync...")
-            calendarSyncer.sync(account.userId, session, calendarApi)
+            val lastSyncTime = syncSettings.lastCalendarSyncTime
+            calendarSyncer.sync(account.userId, session, calendarApi, lastSyncTime)
             syncSettings.lastCalendarSyncTime = System.currentTimeMillis()
             Log.i(TAG, "Calendar sync completed successfully")
             Result.success()

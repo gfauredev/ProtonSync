@@ -21,15 +21,16 @@ class CalendarSyncer @Inject constructor(
 
     private val TAG = "CalendarSyncer"
 
-    suspend fun sync(userId: UserId, session: CalendarSession, calendarApi: CalendarApi) {
+    suspend fun sync(userId: UserId, session: CalendarSession, calendarApi: CalendarApi, lastSyncTime: Long) {
         syncAccount.ensureExists(ACCOUNT_TYPE, ACCOUNT_NAME)
         val resolver = context.contentResolver
         Log.i(TAG, "Fetching calendar list...")
         val calendarList = calendarApi.getCalendars().calendars.filter { it.isDisplayed }
         Log.i(TAG, "Calendar list: ${calendarList.map { "${it.displayName} (${it.id})" }}")
 
-        val startEpoch = 1577836800L  // 2020-01-01 UTC
-        val endEpoch = 4102444800L    // 2100-01-01 UTC
+        val nowSec = System.currentTimeMillis() / 1000
+        val startEpoch = nowSec - (90L * 24 * 60 * 60) // 3 months ago (90 days)
+        val endEpoch = nowSec + (730L * 24 * 60 * 60)  // 2 years from now (730 days)
 
         for (calendarInfo in calendarList) {
             val calId = getOrCreateAndroidCalendar(resolver, calendarInfo)
@@ -52,8 +53,16 @@ class CalendarSyncer @Inject constructor(
                 page++
             } while (true)
 
+            val lastSyncSec = lastSyncTime / 1000
+            val changedEvents = events.filter { it.updateTime > lastSyncSec || it.isDeleted }
+
+            if (changedEvents.isEmpty()) {
+                Log.i(TAG, "No changes in ${calendarInfo.displayName} since last sync.")
+                continue
+            }
+
             // Collect events that have encrypted content (Type 3) to batch-decrypt
-            val eventsToDecrypt = events.filter {
+            val eventsToDecrypt = changedEvents.filter {
                 it.encryptedICalData != null && !it.isDeleted
             }
             Log.i(TAG, "Decrypting ${eventsToDecrypt.size} events for ${calendarInfo.displayName}...")
@@ -61,7 +70,7 @@ class CalendarSyncer @Inject constructor(
             Log.i(TAG, "Decrypted ${decryptedMap.size}/${eventsToDecrypt.size} events")
 
             var written = 0
-            for (eventData in events) {
+            for (eventData in changedEvents) {
                 if (eventData.isDeleted) {
                     deleteEventIfExists(resolver, eventData.uid ?: eventData.id)
                     continue
@@ -69,7 +78,7 @@ class CalendarSyncer @Inject constructor(
                 val decrypted = decryptedMap[eventData.id]
                 if (upsertEvent(resolver, calId, eventData, decrypted)) written++
             }
-            Log.i(TAG, "Wrote $written/${events.size} events for ${calendarInfo.displayName}")
+            Log.i(TAG, "Wrote $written/${changedEvents.size} updated events for ${calendarInfo.displayName}")
         }
     }
 

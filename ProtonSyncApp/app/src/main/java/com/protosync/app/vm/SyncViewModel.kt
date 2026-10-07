@@ -126,7 +126,8 @@ class SyncViewModel @Inject constructor(
             Log.i("SyncViewModel", "runCalendarSync: creating session")
             val session = CalendarSession.create(apiProvider, userId, cryptoContext, user, userManager.getAddresses(userId))
             Log.i("SyncViewModel", "runCalendarSync: starting sync")
-            calendarSyncer.sync(userId, session, api)
+            val lastSyncTime = syncSettings.lastCalendarSyncTime
+            calendarSyncer.sync(userId, session, api, lastSyncTime)
             syncSettings.lastCalendarSyncTime = System.currentTimeMillis()
             Log.i("SyncViewModel", "Calendar sync completed in-process")
             null
